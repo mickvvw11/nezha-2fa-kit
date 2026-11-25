@@ -128,6 +128,51 @@ function run() {
   process.once('SIGINT', stop);
 }
 
+// One-time: install + activate a user frontend theme (default Lotus) through the dashboard's own API.
+// Only works while the admin password is still the default admin/admin (fresh install); otherwise skipped.
+const THEME_REPO = process.env.THEME_REPO || 'https://github.com/fl0w1nd/Lotus';
+const THEME_MARK = path.join(__dirname, 'theme-done.txt');
+function api(method, p, body, cookies) {
+  return new Promise((resolve) => {
+    const data = body ? JSON.stringify(body) : null;
+    const headers = { 'X-Real-Ip': '127.0.0.1', 'Content-Type': 'application/json' };
+    if (cookies.length) headers.Cookie = cookies.join('; ');
+    const csrf = cookies.find((c) => c.startsWith('nz-csrf='));
+    if (csrf) headers['X-CSRF-Token'] = csrf.slice(8);
+    if (data) headers['Content-Length'] = Buffer.byteLength(data);
+    const r = require('http').request({ host: '127.0.0.1', port: INTERNAL, method, path: p, headers }, (res) => {
+      for (const sc of [].concat(res.headers['set-cookie'] || [])) {
+        const kv = sc.split(';')[0]; const k = kv.split('=')[0];
+        const i = cookies.findIndex((c) => c.startsWith(k + '=')); if (i >= 0) cookies.splice(i, 1); cookies.push(kv);
+      }
+      let b = ''; res.on('data', (d) => { b += d; }); res.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { resolve({ success: false, error: b.slice(0, 200) }); } });
+    });
+    r.on('error', (e) => resolve({ success: false, error: e.message })); r.setTimeout(200000, () => r.destroy(new Error('timeout')));
+    if (data) r.write(data); r.end();
+  });
+}
+async function setupTheme() {
+  if (THEME_REPO === 'none' || fs.existsSync(THEME_MARK)) return;
+  const cookies = [];
+  let login;
+  for (let i = 0; i < 30; i++) { login = await api('POST', '/api/v1/login', { username: 'admin', password: 'admin' }, cookies); if (login.success || (login.error && !/ECONNREFUSED/.test(login.error))) break; await new Promise((r) => setTimeout(r, 2000)); }
+  if (!login || !login.success) { log('theme: admin password not default, skip auto theme (install it in 系统设置 > 前端管理)'); fs.writeFileSync(THEME_MARK, 'skipped\n'); return; }
+  await api('GET', '/api/v1/profile', null, cookies); // seeds csrf cookie if missing
+  let tag = process.env.THEME_TAG;
+  if (!tag) {
+    const rel = await api('GET', '/api/v1/frontend/releases?repository=' + encodeURIComponent(THEME_REPO), null, cookies);
+    const r = rel.success && (rel.data.releases || []).find((x) => !x.prerelease && !x.draft);
+    if (!r) { log('theme: cannot list releases:', rel.error || 'none'); return; }
+    tag = r.tag_name;
+  }
+  const inst = await api('POST', '/api/v1/frontend/install', { repository: THEME_REPO, tag, is_admin: false }, cookies);
+  if (!inst.success) { log('theme: install failed:', inst.error); return; }
+  const act = await api('POST', '/api/v1/frontend/activate', { path: inst.data.path, is_admin: false }, cookies);
+  if (!act.success) { log('theme: activate failed:', act.error); return; }
+  fs.writeFileSync(THEME_MARK, `${THEME_REPO} ${tag}\n`);
+  log('theme: installed and activated', inst.data.name || THEME_REPO, tag);
+}
+
 function tunnelToken() {
   if (process.env.TUNNEL_TOKEN) return process.env.TUNNEL_TOKEN.trim();
   if (fs.existsSync(TOKEN_FILE)) return fs.readFileSync(TOKEN_FILE, 'utf8').trim();
@@ -161,6 +206,7 @@ function runTunnel(token) {
     gate.start({ publicPort: PORT, internalPort: INTERNAL, dir: __dirname, log });
     log('App is running');
     run();
+    setTimeout(() => setupTheme().catch((e) => log('theme error:', e.message)), 3000);
     const token = tunnelToken();
     if (token) {
       try { await ensureCloudflared(); runTunnel(token); }

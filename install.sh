@@ -6,6 +6,7 @@
 #   bash install.sh reset            重置 2FA（生成新密钥，所有设备重新验证）
 #   bash install.sh uninstall        卸载（保留 /opt/nezha-2fa 数据，需手动删）
 # 一键：bash <(curl -fsSL https://raw.githubusercontent.com/mickvvw11/nezha-2fa-kit/main/install.sh) install 8008
+# 换主题：THEME_REPO=https://github.com/作者/仓库 bash install.sh install（填 none 不装主题）
 # 国内机器拉 GitHub 慢可以：GH_PROXY=https://ghfast.top/ bash install.sh install
 set -e
 DIR=/opt/nezha-2fa
@@ -69,6 +70,7 @@ Wants=network-online.target
 WorkingDirectory=$DIR
 Environment=SERVER_PORT=$PORT
 Environment=GH_PROXY=${GH_PROXY:-}
+Environment=THEME_REPO=${THEME_REPO:-https://github.com/fl0w1nd/Lotus}
 ExecStart=$N $DIR/panel.js
 Restart=always
 RestartSec=5
