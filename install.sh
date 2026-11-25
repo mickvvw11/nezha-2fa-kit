@@ -2,7 +2,7 @@
 # 哪吒面板 v2 + 谷歌验证器 2FA 一键部署（Linux VPS，需要 root，无需 Docker）
 # 用法：
 #   bash install.sh install [端口]   安装或更新，默认端口 8008
-#   bash install.sh key              显示当前 2FA 密钥
+#   bash install.sh key              显示 2FA 绑定状态（未绑定时给一次性绑定链接）
 #   bash install.sh reset            重置 2FA（生成新密钥，所有设备重新验证）
 #   bash install.sh uninstall        卸载（保留 /opt/nezha-2fa 数据，需手动删）
 # 一键：bash <(curl -fsSL https://raw.githubusercontent.com/mickvvw11/nezha-2fa-kit/main/install.sh) install 8008
@@ -32,17 +32,18 @@ node_bin(){
 }
 
 show_key(){
-  local N; N=$(node_bin)
-  for i in $(seq 1 60); do [ -f "$DIR/gate.json" ] && break; sleep 1; done
-  [ -f "$DIR/gate.json" ] || { red "还没生成 gate.json，看日志：journalctl -u $SVC -n 50"; exit 1; }
-  "$N" -e '
-    const s=require(process.argv[1]);
-    if(!s.enabled){console.log("2FA 当前已关闭，可在后台右下角「🔐 2FA」里开启");process.exit(0)}
-    console.log("谷歌验证器 → ＋ → 输入设置密钥，类型「基于时间」：");
-    console.log("  账号: Nezha:admin");
-    console.log("  密钥: "+s.secret.replace(/(.{4})/g,"$1 ").trim());
-    console.log("  otpauth://totp/Nezha:admin?secret="+s.secret+"&issuer=Nezha");' "$DIR/gate.json"
-  command -v qrencode >/dev/null 2>&1 && "$N" -e 'const s=require(process.argv[1]);if(s.enabled)process.stdout.write("otpauth://totp/Nezha:admin?secret="+s.secret+"&issuer=Nezha")' "$DIR/gate.json" | qrencode -t ANSIUTF8 || true
+  # 密钥加密存放，不再明文打印；未绑定时给出一次性绑定链接
+  local IP PORT L
+  IP=$(curl -fsS4 -m 5 https://ip.sb 2>/dev/null || hostname -I | awk '{print $1}')
+  PORT=$(systemctl show $SVC -p Environment --value 2>/dev/null | tr ' ' '\n' | sed -n 's/^SERVER_PORT=//p')
+  for i in $(seq 1 60); do L=$(journalctl -u $SVC --since "-10min" --no-pager 2>/dev/null | grep -o '__2fa/setup?t=[A-Za-z0-9_-]*' | tail -1); [ -n "$L" ] && break
+    journalctl -u $SVC -n 30 --no-pager 2>/dev/null | grep -q '\[2FA\] enabled (key is encrypted' && break; sleep 1; done
+  if [ -n "$L" ] && ! journalctl -u $SVC --since "-10min" --no-pager | grep -q '\[2FA\] bound from'; then
+    echo "用浏览器打开这个一次性绑定链接，扫码并输入 6 位码完成绑定（用过即失效）："
+    echo "  http://$IP:${PORT:-8008}/$L"
+  else
+    echo "2FA 已绑定。密钥加密存储，需要查看请在后台右下角「🔐 2FA」里输入当前验证码查看；丢了手机用 nezha-2fa reset。"
+  fi
 }
 
 case "${1:-install}" in
@@ -60,6 +61,9 @@ install)
   install -m 755 "$SRC/install.sh" /usr/local/bin/nezha-2fa
   cp -f "$SRC/panel.js" "$SRC/gate.js" "$SRC/install.sh" "$DIR/" 2>/dev/null || true
   N=$(node_bin)
+  # 2FA 主密钥放在数据目录之外（root 600），用于加密 gate.json 中的密钥
+  if [ ! -f /etc/nezha-2fa.env ]; then umask 077; echo "NEZHA_2FA_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > /etc/nezha-2fa.env; fi
+  chmod 600 /etc/nezha-2fa.env
   cat > /etc/systemd/system/$SVC.service <<UNIT
 [Unit]
 Description=Nezha Dashboard v2 with TOTP gate
@@ -69,6 +73,7 @@ Wants=network-online.target
 [Service]
 WorkingDirectory=$DIR
 Environment=SERVER_PORT=$PORT
+EnvironmentFile=/etc/nezha-2fa.env
 Environment=GH_PROXY=${GH_PROXY:-}
 Environment=THEME_REPO=${THEME_REPO:-https://github.com/fl0w1nd/Lotus}
 ExecStart=$N $DIR/panel.js
@@ -90,12 +95,12 @@ UNIT
   echo "Agent 对接地址填 $IP:$PORT（不开 TLS）"
   echo "防火墙记得放行 TCP $PORT"
   echo; show_key
-  echo; echo "以后：nezha-2fa key 查看密钥 · nezha-2fa reset 重置 2FA · 后台右下角「🔐 2FA」可改设置"
+  echo; echo "以后：nezha-2fa key 查看绑定状态/链接 · nezha-2fa reset 重置 2FA · 后台右下角「🔐 2FA」可改设置"
   ;;
 key) show_key ;;
 reset)
   systemctl stop $SVC; rm -f "$DIR/gate.json"; systemctl start $SVC
-  grn "已重置，新密钥："; show_key ;;
+  grn "已重置，生成了新密钥："; sleep 3; show_key ;;
 uninstall)
   systemctl disable --now $SVC 2>/dev/null || true
   rm -f /etc/systemd/system/$SVC.service /usr/local/bin/nezha-2fa; systemctl daemon-reload

@@ -15,27 +15,50 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 
 function start({ publicPort, internalPort, dir, log, issuer = 'Nezha', account = 'admin' }) {
   const stateFile = path.join(dir, 'gate.json');
-  let st;
-  if (fs.existsSync(stateFile)) st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  // --- at-rest encryption: secrets in gate.json are AES-256-GCM encrypted.
+  // Master key: env NEZHA_2FA_KEY (recommended, keep it outside the data dir), else gate.key (0600) next to gate.json.
+  const keyFile = path.join(dir, 'gate.key');
+  let master;
+  if (process.env.NEZHA_2FA_KEY) master = crypto.createHash('sha256').update(process.env.NEZHA_2FA_KEY).digest();
   else {
-    // migrate v1 files if present
-    const old = path.join(dir, 'totp-secret.txt'), oldKey = path.join(dir, 'gate-key.txt');
-    st = {
-      enabled: true,
-      secret: fs.existsSync(old) ? fs.readFileSync(old, 'utf8').trim() : newSecret(),
-      sessionKey: fs.existsSync(oldKey) ? fs.readFileSync(oldKey, 'utf8').trim() : crypto.randomBytes(32).toString('hex'),
-      days: 7, pending: null, lastUsed: -1,
-    };
+    if (!fs.existsSync(keyFile)) fs.writeFileSync(keyFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
+    try { fs.chmodSync(keyFile, 0o600); } catch (e) {}
+    master = crypto.createHash('sha256').update(fs.readFileSync(keyFile, 'utf8').trim()).digest();
   }
-  const save = () => { fs.writeFileSync(stateFile, JSON.stringify(st, null, 2), { mode: 0o600 }); try { fs.chmodSync(stateFile, 0o600); } catch (e) {} };
+  const SECRET_FIELDS = ['secret', 'sessionKey', 'pending', 'setupToken'];
+  const seal = (obj) => { const iv = crypto.randomBytes(12); const c = crypto.createCipheriv('aes-256-gcm', master, iv); const d = Buffer.concat([c.update(JSON.stringify(obj)), c.final()]); return { iv: iv.toString('base64'), tag: c.getAuthTag().toString('base64'), data: d.toString('base64') }; };
+  const unseal = (e) => { const c = crypto.createDecipheriv('aes-256-gcm', master, Buffer.from(e.iv, 'base64')); c.setAuthTag(Buffer.from(e.tag, 'base64')); return JSON.parse(Buffer.concat([c.update(Buffer.from(e.data, 'base64')), c.final()]).toString()); };
+  const fresh = () => ({ enabled: true, bound: false, secret: newSecret(), sessionKey: crypto.randomBytes(32).toString('hex'), setupToken: crypto.randomBytes(18).toString('base64url'), days: 7, pending: null, lastUsed: -1 });
+  let st = null;
+  if (fs.existsSync(stateFile)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+      if (raw.enc) { st = { ...raw, ...unseal(raw.enc) }; delete st.enc; }
+      else { st = raw; if (st.bound === undefined) st.bound = true; } // migrate plaintext v2 (already bound)
+    } catch (e) { log('[2FA] WARNING: cannot decrypt gate.json (master key changed?), generating a new key'); st = null; }
+  }
+  if (!st) {
+    const old = path.join(dir, 'totp-secret.txt'), oldKey = path.join(dir, 'gate-key.txt');
+    st = fresh();
+    if (fs.existsSync(old)) { st.secret = fs.readFileSync(old, 'utf8').trim(); st.bound = true; st.setupToken = null; }
+    if (fs.existsSync(oldKey)) st.sessionKey = fs.readFileSync(oldKey, 'utf8').trim();
+  }
+  const save = () => {
+    const plain = {}, sec = {};
+    for (const [k, v] of Object.entries(st)) (SECRET_FIELDS.includes(k) ? sec : plain)[k] = v;
+    fs.writeFileSync(stateFile, JSON.stringify({ ...plain, enc: seal(sec) }, null, 2), { mode: 0o600 });
+    try { fs.chmodSync(stateFile, 0o600); } catch (e) {}
+  };
   save();
   for (const f of ['totp-secret.txt', 'gate-key.txt']) { try { fs.unlinkSync(path.join(dir, f)); } catch (e) {} }
 
   const uri = (sec) => `otpauth://totp/${encodeURIComponent(issuer)}:${encodeURIComponent(account)}?secret=${sec}&issuer=${encodeURIComponent(issuer)}`;
-  if (st.enabled) {
-    log('[2FA] enabled. Google Authenticator key (time-based): ' + st.secret.replace(/(.{4})/g, '$1 ').trim());
-    log('[2FA] ' + uri(st.secret));
-  } else log('[2FA] disabled (turn on at /__2fa/settings)');
+  const announce = () => {
+    if (!st.enabled) return log('[2FA] disabled (turn on at /__2fa/settings)');
+    if (!st.bound) return log('[2FA] NOT BOUND YET. One-time setup link (open in your browser, then scan): http://<your-host>:' + publicPort + '/__2fa/setup?t=' + st.setupToken);
+    log('[2FA] enabled (key is encrypted in gate.json; view it in the dashboard 🔐 2FA settings)');
+  };
+  announce();
 
   function verify(code, secB32, consume = true) {
     code = String(code || '').replace(/\D/g, '');
@@ -98,7 +121,7 @@ button.sec{background:#334155}button.danger{background:#b91c1c}.msg{color:#f8717
 #qr{background:#fff;padding:8px;border-radius:8px;display:inline-block;margin:8px 0}#qr:empty{display:none}hr{border:0;border-top:1px solid #334155;margin:16px 0}a{color:#93c5fd}`;
 
   const loginPage = (msg, next) => `<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>二次验证</title><style>${CSS}</style></head>
-<body><form class="card" method="post" action="/__2fa" style="text-align:center"><h3>输入谷歌验证器 6 位码</h3><input class="code" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" autofocus>
+<body><form class="card" method="post" action="/__2fa" style="text-align:center"><h3>输入谷歌验证器 6 位码</h3>${st.bound ? '' : '<p class="muted">还没绑定验证器：打开服务器控制台里 [2FA] 那行一次性绑定链接。</p>'}<input class="code" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" autofocus>
 <input type="hidden" name="next" value="${esc(next)}"><p class="msg">${esc(msg)}</p><button>验证</button></form></body></html>`;
 
   const settingsPage = () => `<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>2FA 设置</title><style>${CSS}</style>
@@ -174,6 +197,30 @@ a.style.cssText='position:fixed;right:14px;bottom:14px;z-index:99999;background:
     });
   }
 
+  const setupPage = (tok, msg) => `<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>绑定谷歌验证器</title><style>${CSS}</style>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script></head><body><form class="card" method="post" action="/__2fa/setup" style="text-align:center">
+<h3>绑定谷歌验证器</h3><p class="muted">用谷歌验证器扫码，或手动输入下面的密钥（基于时间）。此链接绑定成功后立即失效。</p>
+<div id="qr"></div><div class="key">${esc(st.secret.replace(/(.{4})/g, '$1 ').trim())}</div>
+<p class="muted">再输入验证器里显示的 6 位码确认：</p><input class="code" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" autofocus>
+<input type="hidden" name="t" value="${esc(tok)}"><p class="msg">${esc(msg)}</p><button>完成绑定</button></form>
+<script>try{const q=qrcode(0,'M');q.addData(${JSON.stringify(uri(st.secret))});q.make();document.getElementById('qr').innerHTML=q.createSvgTag(5,0)}catch(e){}</script></body></html>`;
+  const tokOk = (t) => !!(st.setupToken && t && t.length === st.setupToken.length && crypto.timingSafeEqual(Buffer.from(t), Buffer.from(st.setupToken)));
+  function setup(req, res, u, ip) {
+    const html = (code, body) => { res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' }); res.end(body); };
+    const gone = () => html(404, `<!doctype html><meta charset="utf-8"><style>${CSS}</style><div class="card">链接无效或已使用。需要重新绑定：删除 gate.json 后重启。</div>`);
+    if (st.bound || !st.enabled) return gone();
+    if (limited(ip)) return html(429, `<!doctype html><meta charset="utf-8"><style>${CSS}</style><div class="card">尝试次数过多，请 10 分钟后再试</div>`);
+    if (req.method !== 'POST') { const t = u.searchParams.get('t'); if (!tokOk(t)) { addFail(ip); return gone(); } return html(200, setupPage(t, '')); }
+    let body = ''; req.on('data', (d) => { body += d; if (body.length > 2000) req.destroy(); });
+    req.on('end', () => {
+      const q = new URLSearchParams(body); const t = q.get('t');
+      if (!tokOk(t)) { addFail(ip); return gone(); }
+      if (!verify(q.get('code'), st.secret)) { addFail(ip); return html(401, setupPage(t, '验证码不对，确认手机时间准确后再试')); }
+      st.bound = true; st.setupToken = null; save(); log('[2FA] bound from', ip);
+      res.writeHead(302, { 'Set-Cookie': makeCookie(), Location: '/dashboard' }); res.end();
+    });
+  }
+
   function proxy(req, res) {
     const headers = { ...req.headers, 'x-real-ip': ipOf(req) };
     const inject = req.method === 'GET' && req.url.startsWith('/dashboard');
@@ -201,6 +248,7 @@ a.style.cssText='position:fixed;right:14px;bottom:14px;z-index:99999;background:
       const u = new URL(req.url, 'http://x');
       if (u.pathname === '/__2fa/logout') { res.writeHead(302, { 'Set-Cookie': 'nzgate=; Path=/; Max-Age=0', Location: '/' }); return res.end(); }
       if (u.pathname === '/__2fa/api') return api(req, res);
+      if (u.pathname === '/__2fa/setup') return setup(req, res, u, ip);
       if (u.pathname === '/__2fa/settings') {
         if (!hasGate(req)) { res.writeHead(302, { Location: '/__2fa?next=%2F__2fa%2Fsettings' }); return res.end(); }
         return nezhaLoggedIn(req).then((ok) => {

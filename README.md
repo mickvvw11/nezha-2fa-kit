@@ -15,14 +15,14 @@
     bash install.sh install 8008
 国内机器拉 GitHub 慢：`GH_PROXY=https://ghfast.top/ bash install.sh install 8008`
 装完会打印前台/后台地址和 2FA 密钥。常用命令：
-- `nezha-2fa key`   查看密钥
+- `nezha-2fa key`   查看绑定状态（未绑定时给一次性绑定链接）
 - `nezha-2fa reset` 丢了手机时重置密钥
 - `nezha-2fa uninstall` 卸载
 
 ## 二、翼龙/Pterodactyl 面板的 Node.js 小鸡（如 Host-Ship，无 root）
 1. 文件管理里上传 `panel.js` 和 `gate.js` 到根目录。
 2. Startup 里把启动文件（MAIN_FILE）改成 `panel.js`，镜像选 Node.js 18 以上。
-3. 重启，控制台会打印 `[2FA] ... key`，把那串密钥加到谷歌验证器。
+3. 重启，控制台会打印 `[2FA] NOT BOUND YET` 和一条一次性绑定链接（把 `<your-host>` 换成服务器 IP），浏览器打开、扫码、输 6 位码即完成，链接随即失效。
 4. 丢了手机：在文件管理删掉 `gate.json` 再重启，会生成新密钥。
 
 ## 主题
@@ -38,6 +38,7 @@
 
 ## 说明
 - 哪吒本体只监听 127.0.0.1:18008，外网只能经过 2FA 门。
+- 安全：`gate.json` 里的 TOTP 密钥和会话密钥用 AES-256-GCM 加密，文件权限 600；控制台不再打印密钥。主密钥来自环境变量 `NEZHA_2FA_KEY`（一键脚本放在 `/etc/nezha-2fa.env`，root 600，和数据目录分开）；面板托管环境没有该变量时退回同目录的 `gate.key`。注意：能改服务器文件的人总能绕过任何网页 2FA。
 - 密钥保存在 `gate.json`，哪吒数据在 `nezha/data/`，迁移时连同两者一起拷走。
 - 系统设置里「前端真实 IP 请求头」请保持 `X-Real-Ip`，否则防火墙会把所有人当成 127.0.0.1。
 - 可选：在目录放 `cf-token.txt`（Cloudflare Tunnel token）会自动启动 cloudflared 隧道。
