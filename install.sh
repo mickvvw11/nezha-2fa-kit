@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# 哪吒面板 v2 + 谷歌验证器 2FA 一键部署（Linux VPS，需要 root，无需 Docker）
+# 哪吒面板 v2 + 防护层（隐藏面板 / 防爆破）一键部署（Linux VPS，需要 root，无需 Docker）
+# 需要带原生 TOTP 的哪吒 dashboard：CUSTOM_GZ=/路径/dashboard.gz bash install.sh install 8008
 # 用法：
 #   bash install.sh install [端口]   安装或更新，默认端口 8008
-#   bash install.sh key              显示 2FA 绑定状态（未绑定时给一次性绑定链接）
-#   bash install.sh reset            重置 2FA（生成新密钥，所有设备重新验证）
+#   bash install.sh bootstrap on|off 首次部署用：允许没开 TOTP 的账号登录（开完 TOTP 务必 off）
+#   bash install.sh unlock           清除防爆破锁定记录并重启
+#   bash install.sh shield off|on    应急：关闭/恢复防护层（off 时哪吒直接对外）
 #   bash install.sh uninstall        卸载（保留 /opt/nezha-2fa 数据，需手动删）
 # 一键：bash <(curl -fsSL https://raw.githubusercontent.com/mickvvw11/nezha-2fa-kit/main/install.sh) install 8008
 # 换主题：THEME_REPO=https://github.com/作者/仓库 bash install.sh install（填 none 不装主题）
@@ -31,21 +33,6 @@ node_bin(){
   echo "$DIR/node/bin/node"
 }
 
-show_key(){
-  # 密钥加密存放，不再明文打印；未绑定时给出一次性绑定链接
-  local IP PORT L
-  IP=$(curl -fsS4 -m 5 https://ip.sb 2>/dev/null || hostname -I | awk '{print $1}')
-  PORT=$(systemctl show $SVC -p Environment --value 2>/dev/null | tr ' ' '\n' | sed -n 's/^SERVER_PORT=//p')
-  for i in $(seq 1 60); do L=$(journalctl -u $SVC --since "-10min" --no-pager 2>/dev/null | grep -o '__2fa/setup?t=[A-Za-z0-9_-]*' | tail -1); [ -n "$L" ] && break
-    journalctl -u $SVC -n 30 --no-pager 2>/dev/null | grep -q '\[2FA\] enabled (key is encrypted' && break; sleep 1; done
-  if [ -n "$L" ] && ! journalctl -u $SVC --since "-10min" --no-pager | grep -q '\[2FA\] bound from'; then
-    echo "用浏览器打开这个一次性绑定链接，扫码并输入 6 位码完成绑定（用过即失效）："
-    echo "  http://$IP:${PORT:-8008}/$L"
-  else
-    echo "2FA 已绑定。密钥加密存储，需要查看请在后台右下角「🔐 2FA」里输入当前验证码查看；丢了手机用 nezha-2fa reset。"
-  fi
-}
-
 case "${1:-install}" in
 install)
   PORT="${2:-8008}"
@@ -60,20 +47,20 @@ install)
   install -m 644 "$SRC/gate.js" "$DIR/gate.js"
   install -m 755 "$SRC/install.sh" /usr/local/bin/nezha-2fa
   cp -f "$SRC/panel.js" "$SRC/gate.js" "$SRC/install.sh" "$DIR/" 2>/dev/null || true
+  if [ -n "${CUSTOM_GZ:-}" ]; then install -m 600 "$CUSTOM_GZ" "$DIR/dashboard-custom.gz"; fi
+  FRESH=0; [ -f "$DIR/nezha/data/sqlite.db" ] || FRESH=1
+  if [ ! -f "$DIR/dashboard-custom.gz" ]; then red "警告：没有提供带原生 TOTP 的 dashboard（CUSTOM_GZ），官方版没有 TOTP，防护层会拒绝登录。"; fi
+  if [ $FRESH = 1 ]; then touch "$DIR/shield-allow-no-totp.txt"; fi
   N=$(node_bin)
-  # 2FA 主密钥放在数据目录之外（root 600），用于加密 gate.json 中的密钥
-  if [ ! -f /etc/nezha-2fa.env ]; then umask 077; echo "NEZHA_2FA_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > /etc/nezha-2fa.env; fi
-  chmod 600 /etc/nezha-2fa.env
   cat > /etc/systemd/system/$SVC.service <<UNIT
 [Unit]
-Description=Nezha Dashboard v2 with TOTP gate
+Description=Nezha Dashboard v2 with shield
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 WorkingDirectory=$DIR
 Environment=SERVER_PORT=$PORT
-EnvironmentFile=/etc/nezha-2fa.env
 Environment=GH_PROXY=${GH_PROXY:-}
 Environment=THEME_REPO=${THEME_REPO:-https://github.com/fl0w1nd/Lotus}
 ExecStart=$N $DIR/panel.js
@@ -91,19 +78,24 @@ UNIT
   IP=$(curl -fsS4 -m 5 https://ip.sb 2>/dev/null || hostname -I | awk '{print $1}')
   grn "完成！"
   echo "前台:  http://$IP:$PORT/"
-  echo "后台:  http://$IP:$PORT/dashboard   （默认账号 admin / admin，进去立刻改密码）"
+  echo "登录:  http://$IP:$PORT/   （防护层登录页：用户名 + 密码 + 6 位验证码）"
   echo "Agent 对接地址填 $IP:$PORT（不开 TLS）"
   echo "防火墙记得放行 TCP $PORT"
-  echo; show_key
-  echo; echo "以后：nezha-2fa key 查看绑定状态/链接 · nezha-2fa reset 重置 2FA · 后台右下角「🔐 2FA」可改设置"
+  if [ $FRESH = 1 ]; then
+    echo; red "首次部署：已临时允许无 TOTP 登录。用 admin / admin（验证码随便填 6 位数字）登录，立刻改密码并在个人资料里开启 TOTP，然后执行：nezha-2fa bootstrap off"
+  fi
+  echo; echo "以后：后台右下角「🛡 防护」可开关隐藏/公开状态页 · nezha-2fa unlock 解锁 · nezha-2fa shield off 应急关闭"
   ;;
-key) show_key ;;
-reset)
-  systemctl stop $SVC; rm -f "$DIR/gate.json"; systemctl start $SVC
-  grn "已重置，生成了新密钥："; sleep 3; show_key ;;
+bootstrap)
+  if [ "$2" = on ]; then touch "$DIR/shield-allow-no-totp.txt"; red "已允许无 TOTP 登录（仅限首次部署）"; else rm -f "$DIR/shield-allow-no-totp.txt"; grn "已关闭无 TOTP 登录"; fi
+  systemctl restart $SVC ;;
+unlock) systemctl stop $SVC; rm -f "$DIR/shield-lock.json"; systemctl start $SVC; grn "已清除锁定" ;;
+shield)
+  if [ "$2" = off ]; then touch "$DIR/gate-off.txt"; red "防护层已关闭，哪吒直接对外"; else rm -f "$DIR/gate-off.txt"; grn "防护层已恢复"; fi
+  systemctl restart $SVC ;;
 uninstall)
   systemctl disable --now $SVC 2>/dev/null || true
   rm -f /etc/systemd/system/$SVC.service /usr/local/bin/nezha-2fa; systemctl daemon-reload
   grn "已卸载服务。数据还在 $DIR，确认不要了再 rm -rf $DIR" ;;
-*) echo "用法: bash install.sh install [端口] | key | reset | uninstall" ;;
+*) echo "用法: bash install.sh install [端口] | bootstrap on|off | unlock | shield off|on | uninstall" ;;
 esac

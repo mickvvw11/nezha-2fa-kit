@@ -28,6 +28,11 @@ const CF_URL = `${GH}https://github.com/cloudflare/cloudflared/releases/latest/d
 const LOCAL_ONLY = fs.existsSync(path.join(__dirname, 'local-only.txt'));
 // TOTP gate: public PORT is served by this script; Nezha listens on 127.0.0.1:INTERNAL.
 const INTERNAL = parseInt(process.env.NEZHA_INTERNAL_PORT || '18008', 10);
+// gate-off.txt (or GATE=off): no gate, Nezha listens on the public port itself (use with a build that has native TOTP).
+const NO_GATE = process.env.GATE === 'off' || fs.existsSync(path.join(__dirname, 'gate-off.txt'));
+const NZPORT = NO_GATE ? PORT : INTERNAL;
+// dashboard-custom.gz next to this script: use that (gzip'd) dashboard binary instead of the official release.
+const CUSTOM_GZ = path.join(__dirname, 'dashboard-custom.gz');
 
 function log(...a) { console.log('[panel]', ...a); }
 
@@ -81,7 +86,20 @@ function extractFirstFile(buf) {
 
 async function ensureBinary() {
   fs.mkdirSync(DATA, { recursive: true });
-  const have = fs.existsSync(BIN) && fs.existsSync(VERFILE) && fs.readFileSync(VERFILE, 'utf8').trim() === VERSION;
+  const cur = fs.existsSync(VERFILE) ? fs.readFileSync(VERFILE, 'utf8').trim() : '';
+  if (fs.existsSync(CUSTOM_GZ)) {
+    const gz = fs.readFileSync(CUSTOM_GZ);
+    const tag = 'custom-' + require('crypto').createHash('sha256').update(gz).digest('hex').slice(0, 12);
+    if (fs.existsSync(BIN) && cur === tag) return;
+    const db = path.join(DATA, 'sqlite.db');
+    if (fs.existsSync(db)) { const bak = db + '.bak-' + new Date().toISOString().replace(/[:.]/g, '-'); fs.copyFileSync(db, bak); log('database backed up to', path.basename(bak)); }
+    if (fs.existsSync(BIN) && cur && !cur.startsWith('custom-')) fs.copyFileSync(BIN, BIN + '.official');
+    const tmp = BIN + '.new'; fs.writeFileSync(tmp, zlib.gunzipSync(gz)); fs.chmodSync(tmp, 0o755); fs.renameSync(tmp, BIN);
+    fs.writeFileSync(VERFILE, tag);
+    log('using custom dashboard binary', tag);
+    return;
+  }
+  const have = fs.existsSync(BIN) && cur === VERSION;
   if (have) return;
   log('downloading dashboard', VERSION, ARCH);
   const zip = await download(DL_URL);
@@ -98,15 +116,13 @@ function ensureConfig() {
     c = c.replace(/^listenport:.*\n?/m, '');
     c = c.replace(/^listen_port:.*\n?/m, '').replace(/^listen_host:.*\n?/m, '').replace(/^web_real_ip_header:.*\n?/m, '');
     if (!c.endsWith('\n')) c += '\n';
-    c += `listen_port: ${INTERNAL}\nlisten_host: 127.0.0.1\nweb_real_ip_header: X-Real-Ip\n`;
-    log('nezha internal 127.0.0.1:' + INTERNAL + ', public gate on port', PORT);
+    if (NO_GATE) { c += `listen_port: ${PORT}\nlisten_host: ${LOCAL_ONLY ? '127.0.0.1' : '0.0.0.0'}\n`; log('gate off, nezha listens on port', PORT); }
+    else { c += `listen_port: ${INTERNAL}\nlisten_host: 127.0.0.1\nweb_real_ip_header: X-Real-Ip\n`; log('nezha internal 127.0.0.1:' + INTERNAL + ', public gate on port', PORT); }
     fs.writeFileSync(CFG, c);
     return;
   }
   fs.writeFileSync(CFG, [
-    `listen_port: ${INTERNAL}`,
-    'listen_host: 127.0.0.1',
-    'web_real_ip_header: X-Real-Ip',
+    ...(NO_GATE ? [`listen_port: ${PORT}`, `listen_host: ${LOCAL_ONLY ? '127.0.0.1' : '0.0.0.0'}`] : [`listen_port: ${INTERNAL}`, 'listen_host: 127.0.0.1', 'web_real_ip_header: X-Real-Ip']),
     'language: zh_CN',
     'site_name: 哪吒监控',
     'location: Asia/Shanghai',
@@ -140,7 +156,7 @@ function api(method, p, body, cookies) {
     const csrf = cookies.find((c) => c.startsWith('nz-csrf='));
     if (csrf) headers['X-CSRF-Token'] = csrf.slice(8);
     if (data) headers['Content-Length'] = Buffer.byteLength(data);
-    const r = require('http').request({ host: '127.0.0.1', port: INTERNAL, method, path: p, headers }, (res) => {
+    const r = require('http').request({ host: '127.0.0.1', port: NZPORT, method, path: p, headers }, (res) => {
       for (const sc of [].concat(res.headers['set-cookie'] || [])) {
         const kv = sc.split(';')[0]; const k = kv.split('=')[0];
         const i = cookies.findIndex((c) => c.startsWith(k + '=')); if (i >= 0) cookies.splice(i, 1); cookies.push(kv);
@@ -203,7 +219,7 @@ function runTunnel(token) {
   try {
     await ensureBinary();
     ensureConfig();
-    gate.start({ publicPort: PORT, internalPort: INTERNAL, dir: __dirname, log });
+    if (!NO_GATE) gate.start({ publicPort: PORT, internalPort: INTERNAL, dir: __dirname, log });
     log('App is running');
     run();
     setTimeout(() => setupTheme().catch((e) => log('theme error:', e.message)), 3000);
